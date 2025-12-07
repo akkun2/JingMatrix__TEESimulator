@@ -111,6 +111,24 @@ class KeyMintSecurityLevelInterceptor(
             SystemLogger.debug(
                 "[TX_ID: $txId] CreateOperationResponse: ${response.iOperation} ${response.operationChallenge}"
             )
+
+            // Intercept the IKeystoreOperation binder
+            response.iOperation?.let { operation ->
+                val operationBinder = operation.asBinder()
+                if (!interceptedOperations.containsKey(operationBinder)) {
+                    SystemLogger.info("Found new IKeystoreOperation. Registering interceptor...")
+                    val interceptor = OperationInterceptor(operation)
+                    val backdoor = getBackdoor(target)
+                    if (backdoor != null) {
+                        register(backdoor, operationBinder, interceptor)
+                        interceptedOperations[operationBinder] = interceptor
+                    } else {
+                        SystemLogger.error(
+                            "Failed to get backdoor to register OperationInterceptor."
+                        )
+                    }
+                }
+            }
         } else if (code == GENERATE_KEY_TRANSACTION) {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
 
@@ -255,6 +273,8 @@ class KeyMintSecurityLevelInterceptor(
         private val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
         // A set to quickly identify keys that were generated for attestation purposes.
         private val attestationKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
+        // Stores interceptors for active cryptographic operations.
+        private val interceptedOperations = ConcurrentHashMap<IBinder, OperationInterceptor>()
 
         // --- Public Accessors for Other Interceptors ---
         fun getGeneratedKeyResponse(keyId: KeyIdentifier): KeyEntryResponse? =
@@ -273,6 +293,12 @@ class KeyMintSecurityLevelInterceptor(
             }
             if (attestationKeys.remove(keyId)) {
                 SystemLogger.debug("Remove cached attestaion key ${keyId}")
+            }
+        }
+
+        fun removeOperationInterceptor(operationBinder: IBinder) {
+            if (interceptedOperations.remove(operationBinder) != null) {
+                SystemLogger.debug("Removed operation interceptor for binder: $operationBinder")
             }
         }
 
