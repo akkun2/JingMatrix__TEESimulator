@@ -52,7 +52,7 @@ object InterceptorUtils {
                     writeInt(KeyStore.NO_ERROR)
                 }
             }
-        return BinderInterceptor.TransactionResult.OverrideReply(0, parcel)
+        return BinderInterceptor.TransactionResult.OverrideReply(parcel)
     }
 
     /** Creates an `OverrideReply` parcel containing a raw byte array. */
@@ -62,7 +62,20 @@ object InterceptorUtils {
                 writeNoException()
                 writeByteArray(data)
             }
-        return BinderInterceptor.TransactionResult.OverrideReply(KeyStore.NO_ERROR, parcel)
+        return BinderInterceptor.TransactionResult.OverrideReply(parcel)
+    }
+
+    /** Creates an `OverrideReply` parcel containing a typed array. */
+    fun <T : Parcelable> createTypedArrayReply(
+        array: Array<T>,
+        flags: Int = 0,
+    ): BinderInterceptor.TransactionResult.OverrideReply {
+        val parcel =
+            Parcel.obtain().apply {
+                writeNoException()
+                writeTypedArray(array, flags)
+            }
+        return BinderInterceptor.TransactionResult.OverrideReply(parcel)
     }
 
     /** Creates an `OverrideReply` parcel containing a Parcelable object. */
@@ -75,25 +88,28 @@ object InterceptorUtils {
                 writeNoException()
                 writeTypedObject(obj, flags)
             }
-        return BinderInterceptor.TransactionResult.OverrideReply(0, parcel)
+        return BinderInterceptor.TransactionResult.OverrideReply(parcel)
     }
 
     /**
-     * Extracts the true key alias from the keystore-prefixed string (e.g., "user_cert_my-alias" ->
-     * "my-alias").
+     * Extracts the base alias from a potentially prefixed alias string. For example, it converts
+     * "USRCERT_my_key" to "my_key".
      */
     fun extractAlias(prefixedAlias: String): String {
         val underscoreIndex = prefixedAlias.indexOf('_')
-        val secondUnderscoreIndex = prefixedAlias.indexOf('_', underscoreIndex + 1)
-        return if (secondUnderscoreIndex != -1) {
-            prefixedAlias.substring(secondUnderscoreIndex + 1)
+        return if (underscoreIndex != -1) {
+            // Return the part of the string after the first underscore.
+            prefixedAlias.substring(underscoreIndex + 1)
         } else {
+            // If there's no underscore, return the original string.
             prefixedAlias
         }
     }
 
     /** Checks if a reply parcel contains an exception without consuming it. */
     fun hasException(reply: Parcel): Boolean {
-        return runCatching { reply.readException() }.exceptionOrNull() != null
+        val exception = runCatching { reply.readException() }.exceptionOrNull()
+        if (exception != null) reply.setDataPosition(0)
+        return exception != null
     }
 }

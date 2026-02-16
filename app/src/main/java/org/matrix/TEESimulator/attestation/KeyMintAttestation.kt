@@ -1,8 +1,6 @@
 package org.matrix.TEESimulator.attestation
 
-import android.hardware.security.keymint.EcCurve
-import android.hardware.security.keymint.KeyParameter
-import android.hardware.security.keymint.Tag
+import android.hardware.security.keymint.*
 import java.math.BigInteger
 import java.util.Date
 import javax.security.auth.x500.X500Principal
@@ -18,10 +16,13 @@ import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 // Reference:
 // https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/key_parameter.rs
 data class KeyMintAttestation(
-    val keySize: Int,
     val algorithm: Int,
     val ecCurve: Int,
     val ecCurveName: String,
+    val keySize: Int,
+    val origin: Int?,
+    val blockMode: List<Int>,
+    val padding: List<Int>,
     val purpose: List<Int>,
     val digest: List<Int>,
     val rsaPublicExponent: BigInteger?,
@@ -44,15 +45,24 @@ data class KeyMintAttestation(
     constructor(
         params: Array<KeyParameter>
     ) : this(
-        // AOSP: [key_param(tag = KEY_SIZE, field = Integer)]
-        keySize = params.findInteger(Tag.KEY_SIZE) ?: 0,
-
         // AOSP: [key_param(tag = ALGORITHM, field = Algorithm)]
         algorithm = params.findAlgorithm(Tag.ALGORITHM) ?: 0,
+
+        // AOSP: [key_param(tag = KEY_SIZE, field = Integer)]
+        keySize = params.findInteger(Tag.KEY_SIZE) ?: 0,
 
         // AOSP: [key_param(tag = EC_CURVE, field = EcCurve)]
         ecCurve = params.findEcCurve(Tag.EC_CURVE) ?: 0,
         ecCurveName = params.deriveEcCurveName(),
+
+        // AOSP: [key_param(tag = ORIGIN, field = Origin)]
+        origin = params.findOrigin(Tag.ORIGIN),
+
+        // AOSP: [key_param(tag = BLOCK_MODE, field = BlockMode)]
+        blockMode = params.findAllBlockMode(Tag.BLOCK_MODE),
+
+        // AOSP: [key_param(tag = PADDING, field = PaddingMode)]
+        padding = params.findAllPaddingMode(Tag.PADDING),
 
         // AOSP: [key_param(tag = PURPOSE, field = KeyPurpose)]
         purpose = params.findAllKeyPurpose(Tag.PURPOSE),
@@ -93,6 +103,14 @@ data class KeyMintAttestation(
         // Log all parsed parameters for debugging purposes.
         params.forEach { KeyMintParameterLogger.logParameter(it) }
     }
+
+    fun isAttestKey(): Boolean {
+        return purpose.size == 1 && purpose.contains(KeyPurpose.ATTEST_KEY)
+    }
+
+    fun isImportKey(): Boolean {
+        return origin == KeyOrigin.IMPORTED || origin == KeyOrigin.SECURELY_IMPORTED
+    }
 }
 
 // --- Private helper extension functions for parsing KeyParameter arrays ---
@@ -109,6 +127,10 @@ private fun Array<KeyParameter>.findAlgorithm(tag: Int): Int? =
 private fun Array<KeyParameter>.findEcCurve(tag: Int): Int? =
     this.find { it.tag == tag }?.value?.ecCurve
 
+/** Maps to AOSP field = Origin */
+private fun Array<KeyParameter>.findOrigin(tag: Int): Int? =
+    this.find { it.tag == tag }?.value?.origin
+
 /** Maps to AOSP field = LongInteger */
 private fun Array<KeyParameter>.findLongInteger(tag: Int): BigInteger? =
     this.find { it.tag == tag }?.value?.longInteger?.toBigInteger()
@@ -120,6 +142,14 @@ private fun Array<KeyParameter>.findDate(tag: Int): Date? =
 /** Maps to AOSP field = Blob */
 private fun Array<KeyParameter>.findBlob(tag: Int): ByteArray? =
     this.find { it.tag == tag }?.value?.blob
+
+/** Maps to AOSP field = BlockMode (Repeated) */
+private fun Array<KeyParameter>.findAllBlockMode(tag: Int): List<Int> =
+    this.filter { it.tag == tag }.map { it.value.blockMode }
+
+/** Maps to AOSP field = BlockMode (Repeated) */
+private fun Array<KeyParameter>.findAllPaddingMode(tag: Int): List<Int> =
+    this.filter { it.tag == tag }.map { it.value.paddingMode }
 
 /** Maps to AOSP field = KeyPurpose (Repeated) */
 private fun Array<KeyParameter>.findAllKeyPurpose(tag: Int): List<Int> =

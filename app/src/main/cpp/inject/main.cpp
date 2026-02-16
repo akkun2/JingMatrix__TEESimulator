@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -17,6 +18,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -94,10 +96,6 @@ constexpr size_t kMagicLength = 16;
 
 constexpr size_t kMaxPathLength = PATH_MAX;
 // Maximum length for file paths.
-
-constexpr const char *kSystemFileContext = "u:object_r:system_file:s0";
-// SELinux context for system files,
-// used for socket creation and library file context.
 
 constexpr const char *kLibcModule = "libc.so";
 // Name of the C standard library.
@@ -215,8 +213,8 @@ private:
  * @brief Transfers a file descriptor from the injector process to the remote process.
  *
  * This function uses Unix domain sockets with SCM_RIGHTS to send a file descriptor.
- * It involves setting SELinux contexts, creating local and remote sockets, binding,
- * and then coordinating sendmsg/recvmsg calls using ptrace.
+ * It involves creating local and remote sockets, binding, and then coordinating
+ * sendmsg/recvmsg calls using ptrace.
  *
  * @param pid The target process ID.
  * @param lib_path The path to the library file being transferred.
@@ -233,29 +231,14 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
                                                 uintptr_t libc_return_addr) {
     LOGD("Attempting to transfer file descriptor for library: %s", lib_path);
 
-    // 1. Set SELinux context for socket creation in the injector process.
-    // This is crucial for Android where SELinux might prevent socket operations.
-    if (!set_sockcreate_con(constants::kSystemFileContext)) {
-        LOGE("Failed to set socket creation context.");
-        return std::nullopt;
-    }
-
-    // 2. Create a local Unix domain socket for FD transfer.
+    // Create a local Unix domain socket for FD transfer.
     UniqueFd local_socket = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (local_socket == -1) {
         PLOGE("Failed to create local Unix domain socket.");
         return std::nullopt;
     }
 
-    // 3. Set SELinux context for the library file if possible.
-    // This might be required for the target process to open/access it later if directly opening by path.
-    // For FD transfer, this is less critical as the FD's context is inherited, but good practice.
-    if (setfilecon(lib_path, constants::kSystemFileContext) == -1) {
-        // Log a warning, but don't fail, as FD transfer might still work.
-        PLOGE("Failed to set context of library file: %s. This might cause issues.", lib_path);
-    }
-
-    // 4. Open the local library file to get a file descriptor.
+    // Open the local library file to get a file descriptor.
     UniqueFd local_lib_fd = open(lib_path, O_RDONLY | O_CLOEXEC);
     if (local_lib_fd == -1) {
         PLOGE("Failed to open library file: %s", lib_path);
@@ -271,7 +254,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         void *errno_addr; // Address of __errno for getting remote errno.
     } funcs{};
 
-    // 5. Resolve required libc functions in the remote process.
+    // Resolve required libc functions in the remote process.
     funcs.socket_addr = find_func_addr(local_map, remote_map, constants::kLibcModule, "socket");
     funcs.bind_addr = find_func_addr(local_map, remote_map, constants::kLibcModule, "bind");
     funcs.recvmsg_addr = find_func_addr(local_map, remote_map, constants::kLibcModule, "recvmsg");
@@ -306,25 +289,28 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         }
     };
 
-    // 6. Create a Unix domain socket in the remote process.
+    // Create a Unix domain socket in the remote process.
     std::vector<uintptr_t> args = {AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0};
     int remote_fd = static_cast<int>(
         remote_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.socket_addr), libc_return_addr, args));
-    if (remote_fd == -1) {
+    if (remote_fd <= 0) {
+        // remote_call returns 0 on failure.
+        // socket() returning 0 is technically possible (if stdin closed),
+        // but highly unlikely for a daemon. We treat 0 as failure here to catch the injection error.
         errno = get_remote_errno(); // Set local errno for PLOGE.
-        PLOGE("Failed to create remote socket.");
+        PLOGE("Failed to create remote socket (returned %d).", remote_fd);
         return std::nullopt;
     }
     LOGD("Successfully created remote socket with FD: %d", remote_fd);
 
-    // 7. Generate a unique magic string for the abstract Unix domain socket path.
+    // Generate a unique magic string for the abstract Unix domain socket path.
     auto magic = generateMagic(constants::kMagicLength);
     struct sockaddr_un sock_addr{.sun_family = AF_UNIX, .sun_path = {0}};
     // Abstract Unix domain sockets have sun_path[0] as null, and the name starts from sun_path[1].
     memcpy(sock_addr.sun_path + 1, magic.c_str(), magic.size());
     socklen_t addr_len = sizeof(sock_addr.sun_family) + 1 + magic.size(); // Length includes null byte and magic.
 
-    // 8. Push the sockaddr_un structure to the remote process's stack.
+    // Push the sockaddr_un structure to the remote process's stack.
     auto remote_addr = push_memory(pid, regs, &sock_addr, sizeof(sock_addr));
     if (remote_addr == 0) {
         LOGE("Failed to push socket address to remote memory.");
@@ -332,7 +318,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         return std::nullopt;
     }
 
-    // 9. Bind the remote socket to the abstract Unix domain socket path.
+    // Bind the remote socket to the abstract Unix domain socket path.
     args = {static_cast<uintptr_t>(remote_fd), remote_addr, static_cast<uintptr_t>(addr_len)};
     auto bind_result = remote_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.bind_addr), libc_return_addr, args);
     if (bind_result == static_cast<uintptr_t>(-1)) {
@@ -346,7 +332,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     // Prepare control message buffer for SCM_RIGHTS (file descriptor passing).
     char cmsgbuf[CMSG_SPACE(sizeof(int))] = {0};
 
-    // 10. Push the control message buffer to the remote process's stack.
+    // Push the control message buffer to the remote process's stack.
     auto remote_cmsgbuf = push_memory(pid, regs, &cmsgbuf, sizeof(cmsgbuf));
     if (remote_cmsgbuf == 0) {
         LOGE("Failed to push control message buffer to remote memory.");
@@ -359,7 +345,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     msg_hdr.msg_control = reinterpret_cast<void *>(remote_cmsgbuf);
     msg_hdr.msg_controllen = sizeof(cmsgbuf);
 
-    // 11. Push the msghdr structure to the remote process's stack.
+    // Push the msghdr structure to the remote process's stack.
     auto remote_hdr = push_memory(pid, regs, &msg_hdr, sizeof(msg_hdr));
     if (remote_hdr == 0) {
         LOGE("Failed to push message header to remote memory.");
@@ -367,16 +353,16 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         return std::nullopt;
     }
 
-    // 12. Initiate the remote recvmsg call. This will block the remote process.
+    // Initiate the remote recvmsg call. This will block the remote process.
     args = {static_cast<uintptr_t>(remote_fd), remote_hdr, MSG_WAITALL};
-    if (!remote_pre_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.recvmsg_addr), 0, args)) {
+    if (!remote_pre_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.recvmsg_addr), libc_return_addr, args)) {
         LOGE("Failed to initiate remote recvmsg call.");
         close_remote(remote_fd);
         return std::nullopt;
     }
     LOGD("Remote recvmsg initiated, waiting for FD transfer...");
 
-    // 13. Prepare the local msghdr for sending the file descriptor.
+    // Prepare the local msghdr for sending the file descriptor.
     // The msg_control and msg_name fields of the local msghdr are set up.
     msg_hdr.msg_control = &cmsgbuf; // Use local cmsgbuf for sending.
     msg_hdr.msg_name = &sock_addr;
@@ -396,7 +382,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         *reinterpret_cast<int *>(CMSG_DATA(cmsg)) = local_lib_fd; // The FD to send.
     }
 
-    // 14. Send the file descriptor from the injector to the remote process.
+    // Send the file descriptor from the injector to the remote process.
     if (sendmsg(local_socket, &msg_hdr, 0) == -1) {
         PLOGE("Failed to send file descriptor to remote process.");
         // We do not close local_lib_fd here as it might be transferred even if
@@ -407,9 +393,9 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     }
     LOGD("Local FD %d sent to remote process.", local_lib_fd.operator const int &());
 
-    // 15. Complete the remote recvmsg call. This will retrieve the return value.
+    // Complete the remote recvmsg call. This will retrieve the return value.
     auto recvmsg_result =
-        static_cast<ssize_t>(remote_post_call(pid, regs, 0)); // No specific expected return address for recvmsg
+        static_cast<ssize_t>(remote_post_call(pid, regs, libc_return_addr));
     if (recvmsg_result == -1) {
         errno = get_remote_errno();
         PLOGE("Remote recvmsg call failed.");
@@ -418,7 +404,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     }
     LOGD("Remote recvmsg completed with result: %zd", recvmsg_result);
 
-    // 16. Read the control message buffer back from the remote process to extract the FD.
+    // Read the control message buffer back from the remote process to extract the FD.
     if (read_proc(pid, remote_cmsgbuf, &cmsgbuf, sizeof(cmsgbuf)) != sizeof(cmsgbuf)) {
         LOGE("Failed to read control message buffer from remote process.");
         close_remote(remote_fd);
@@ -439,7 +425,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     LOGI("Successfully transferred FD %d to remote process, new remote FD: %d", local_lib_fd.operator const int &(),
          transferred_fd);
 
-    // 17. Close the remote socket.
+    // Close the remote socket.
     close_remote(remote_fd);
 
     return transferred_fd;
@@ -643,6 +629,130 @@ static bool remote_call_entry(int pid, struct user_regs_struct &regs, uintptr_t 
 }
 
 /**
+ * @brief RAII wrapper to ensure a temporary file is deleted (unlinked)
+ * when the object goes out of scope.
+ *
+ * This is crucial for stealth: we want the library to exist on the filesystem
+ * for the shortest time possible.
+ */
+class ScopedFileDeleter {
+public:
+    explicit ScopedFileDeleter(std::string path) : path_(std::move(path)) {}
+
+    ~ScopedFileDeleter() {
+        if (!path_.empty()) {
+            LOGD("Cleaning up staged file: %s", path_.c_str());
+            unlink(path_.c_str());
+        }
+    }
+
+    // Disable copy to prevent double-deletion issues
+    ScopedFileDeleter(const ScopedFileDeleter&) = delete;
+    ScopedFileDeleter& operator=(const ScopedFileDeleter&) = delete;
+
+private:
+    std::string path_;
+};
+
+/**
+ * @brief Copies a file from source to destination.
+ *
+ * @param src Absolute path to source file.
+ * @param dst Absolute path to destination file.
+ * @return True on success, false on failure.
+ */
+static bool copy_file(const char* src, const char* dst) {
+    std::ifstream src_file(src, std::ios::binary);
+    std::ofstream dst_file(dst, std::ios::binary);
+
+    if (!src_file) {
+        PLOGE("Failed to open source file for copying: %s", src);
+        return false;
+    }
+    if (!dst_file) {
+        PLOGE("Failed to open destination file for copying: %s", dst);
+        return false;
+    }
+
+    dst_file << src_file.rdbuf();
+    return src_file.good() && dst_file.good();
+}
+
+/**
+ * @brief Performs injection via the "Staging" method.
+ *
+ * This strategy is used when direct FD passing fails (e.g., due to Seccomp filters).
+ * 1. Copies the library to a world-readable location (/data/local/tmp).
+ * 2. Loads it via standard dlopen().
+ * 3. Immediately deletes the file to hide tracks.
+ *
+ * @param pid The target process ID.
+ * @param regs The target process registers (must be Red-Zone adjusted if x86_64).
+ * @param local_map Local memory map.
+ * @param remote_map Remote memory map.
+ * @param lib_path The path to the original library.
+ * @param libc_return_addr Return address for remote calls.
+ * @return The handle of the loaded library, or std::nullopt on failure.
+ */
+static std::optional<uintptr_t> inject_via_staging(int pid, struct user_regs_struct &regs,
+                                                   const std::vector<lsplt::MapInfo> &local_map,
+                                                   const std::vector<lsplt::MapInfo> &remote_map,
+                                                   const char *lib_path, uintptr_t libc_return_addr) {
+    LOGI("Initiating Staging Fallback mechanism...");
+
+    // Generate a random path in /data/local/tmp
+    // /data/local/tmp is chosen because it is traversable by most contexts.
+    std::string staged_path = "/data/local/tmp/lib" + generateMagic(8) + ".so";
+
+    // Ensure the file is deleted when this function exits (Success or Failure).
+    // The kernel keeps the inode alive for the mapped process even after unlink.
+    ScopedFileDeleter file_guard(staged_path);
+
+    LOGD("Staging library to: %s", staged_path.c_str());
+
+    //  Copy the library
+    if (!copy_file(lib_path, staged_path.c_str())) {
+        LOGE("Failed to copy library during staging.");
+        return std::nullopt;
+    }
+
+    // Set Permissions to 644 (RW-R--R--)
+    // This allows the target process (likely running as a specific UID) to read the file.
+    if (chmod(staged_path.c_str(), 0644) != 0) {
+        PLOGE("Failed to chmod staged file.");
+        return std::nullopt;
+    }
+
+    // Resolve 'dlopen' in the remote process
+    auto dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "dlopen");
+    if (!dlopen_addr) {
+        LOGE("Failed to find 'dlopen' in remote process.");
+        return std::nullopt;
+    }
+
+    // Push the staged path to remote memory
+    uintptr_t remote_path_addr = push_string(pid, regs, staged_path.c_str());
+    if (remote_path_addr == 0) {
+        LOGE("Failed to push staged path string to remote memory.");
+        return std::nullopt;
+    }
+
+    // Call dlopen(path, RTLD_NOW)
+    std::vector<uintptr_t> args = {remote_path_addr, RTLD_NOW};
+    uintptr_t handle = remote_call(pid, regs, reinterpret_cast<uintptr_t>(dlopen_addr),
+                                   libc_return_addr, args);
+
+    if (handle == 0) {
+        std::string error_msg = get_remote_dlerror(pid, regs, local_map, remote_map, libc_return_addr);
+        LOGE("Staged dlopen failed. dlerror: %s", error_msg.c_str());
+        return std::nullopt;
+    }
+
+    LOGI("Successfully loaded staged library. Handle: %p", reinterpret_cast<void*>(handle));
+    return handle;
+}
+
+/**
  * @brief RAII wrapper for ptrace attachment and detachment.
  *
  * This class ensures that PTRACE_ATTACH is followed by PTRACE_DETACH, even if exceptions or early returns occur.
@@ -694,12 +804,31 @@ private:
     bool attached_; // Flag indicating current attachment status.
 };
 
+// RAII Class to ensure registers are always restored
+class RegisterRestorer {
+public:
+    RegisterRestorer(int pid, const struct user_regs_struct& original_regs)
+        : pid_(pid), regs_(original_regs) {}
+
+    ~RegisterRestorer() {
+        // Always restore registers when this object goes out of scope
+        if (set_regs(pid_, regs_)) {
+            LOGD("Original registers for process %d restored.", pid_);
+        } else {
+            PLOGE("Failed to restore original registers for process %d.", pid_);
+        }
+    }
+private:
+    int pid_;
+    struct user_regs_struct regs_;
+};
+
 /**
  * @brief Injects a shared library into a target process using ptrace.
  *
  * This is the main orchestration function for the library injection.
  * It handles attachment, remote memory/register manipulation, FD transfer,
- * remote dlopen/dlsym, and remote entry point execution.
+ * staging fallback, remote dlopen/dlsym, and remote entry point execution.
  *
  * @param pid The target process ID.
  * @param lib_path The absolute path to the shared library to inject.
@@ -742,6 +871,14 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
     backup_regs = current_regs; // Store a copy for restoration.
     LOGD("Process %d registers backed up.", pid);
 
+    // Skip the Red Zone (128 bytes) on x86_64 to prevent stack corruption
+    #if defined(__x86_64__)
+    current_regs.rsp -= 128;
+    #endif
+
+    // Ensures original state is restored even if injection fails/crashes mid-way.
+    RegisterRestorer reg_guard(pid, backup_regs);
+
     // Create a scope to ensure RAII objects are destroyed BEFORE register restoration
     {
         // 4. Scan local and remote memory maps to resolve function addresses.
@@ -760,52 +897,56 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
         }
         LOGD("Found libc return address: %p", reinterpret_cast<void *>(libc_return_addr));
 
-        // 6. Transfer the library's file descriptor to the remote process.
+        // 6. Attempt to transfer the library's file descriptor to the remote process.
+        int remote_fd = -1;
         auto lib_fd_opt = transfer_fd_to_remote(pid, lib_path, current_regs, local_map, remote_map,
                                                 reinterpret_cast<uintptr_t>(libc_return_addr));
-        if (!lib_fd_opt) {
-            LOGE("Failed to transfer library file descriptor for '%s' to target process %d.", lib_path, pid);
-            return false;
-        }
-        RemoteLibraryHandle remote_lib_guard(pid, *lib_fd_opt);
-        LOGD("Library FD %d transferred to remote process %d.", remote_lib_guard.fd(), pid);
-        remote_lib_guard.set_libc_return_addr(reinterpret_cast<uintptr_t>(libc_return_addr));
+        std::optional<RemoteLibraryHandle> remote_lib_guard;
+        std::optional<uintptr_t> handle_opt;
 
-        // 7. Remotely load the library using the transferred file descriptor.
-        auto handle_opt = remote_dlopen(pid, current_regs, local_map, remote_map, remote_lib_guard.fd(), lib_path,
-                                        reinterpret_cast<uintptr_t>(libc_return_addr));
+        if (lib_fd_opt) {
+            remote_fd = *lib_fd_opt;
+            remote_lib_guard.emplace(pid, remote_fd);
+            remote_lib_guard->set_libc_return_addr(reinterpret_cast<uintptr_t>(libc_return_addr));
+
+            LOGD("FD Transfer successful (FD: %d). Attempting android_dlopen_ext...", remote_fd);
+            handle_opt = remote_dlopen(pid, current_regs, local_map, remote_map, remote_fd, lib_path,
+                                       reinterpret_cast<uintptr_t>(libc_return_addr));
+        } else {
+            LOGW("Failed to transfer library file descriptor for '%s' to target process %d.", lib_path, pid);
+        }
+
+        // 7. Staging Fallback (Copy-Inject-Delete) if FD transfer failed.
         if (!handle_opt) {
+            handle_opt = inject_via_staging(pid, current_regs, local_map, remote_map,
+                                            lib_path, reinterpret_cast<uintptr_t>(libc_return_addr));
+        }
+        if (!handle_opt || *handle_opt == 0) {
             LOGE("Failed to load library '%s' in remote process %d.", lib_path, pid);
             // If dlopen fails, the remote_lib_guard.fd() is still valid in the target process and needs to be closed.
             // The RemoteLibraryHandle constructor takes care of this.
             return false;
         }
-        remote_lib_guard.set_handle(*handle_opt);
+        uintptr_t handle = *handle_opt;
+        if (remote_lib_guard) remote_lib_guard->set_handle(handle);
 
         // 8. Find the entry point symbol in the remotely loaded library.
         auto entry_opt = remote_find_entry(pid, current_regs, entry_name, local_map, remote_map,
-                                           remote_lib_guard.handle(), reinterpret_cast<uintptr_t>(libc_return_addr));
+                                           handle, reinterpret_cast<uintptr_t>(libc_return_addr));
         if (!entry_opt) {
             LOGE("Failed to find entry point '%s' in remote library (handle %p).", entry_name,
-                 reinterpret_cast<void *>(remote_lib_guard.handle()));
+                 reinterpret_cast<void *>(handle));
             return false;
         }
         uintptr_t entry_addr = *entry_opt;
 
         // 9. Call the remote entry point function.
-        if (!remote_call_entry(pid, current_regs, entry_addr, remote_lib_guard.handle(),
+        if (!remote_call_entry(pid, current_regs, entry_addr, handle,
                                reinterpret_cast<uintptr_t>(libc_return_addr))) {
             LOGE("Failed to call remote entry point '%s'.", entry_name);
             return false;
         }
     }
-
-    // 10. Restore original registers of the target process.
-    if (!set_regs(pid, backup_regs)) {
-        LOGE("Failed to restore original registers for process %d.", pid);
-        return false;
-    }
-    LOGD("Original registers for process %d restored.", pid);
 
     LOGI("Library injection completed successfully for process %d.", pid);
     return true;

@@ -1,8 +1,6 @@
 package org.matrix.TEESimulator.attestation
 
 import android.annotation.SuppressLint
-import android.app.ActivityThread
-import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import java.security.KeyPairGenerator
@@ -83,16 +81,6 @@ object DeviceAttestationService {
     private fun checkTeeFunctionality(): Boolean {
         SystemLogger.info("Performing TEE functionality check...")
         return try {
-            // Ensure mainline modules and the correct Keystore provider are initialized.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                android.app.ActivityThread.initializeMainlineModules()
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                android.security.keystore2.AndroidKeyStoreProvider.install()
-            } else {
-                android.security.keystore.AndroidKeyStoreProvider.install()
-            }
-
             val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
             val keyPairGenerator =
                 KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
@@ -192,13 +180,15 @@ object DeviceAttestationService {
                 ASN1Sequence.getInstance(
                     fields[AttestationConstants.KEY_DESCRIPTION_SOFTWARE_ENFORCED_INDEX]
                 )
-            if (softwareEnforced.size() >= 3) {
-                moduleHash =
-                    ASN1OctetString.getInstance(
-                            ASN1TaggedObject.getInstance(softwareEnforced.getObjectAt(2)).baseObject
-                        )
-                        .octets
-            }
+            moduleHash =
+                softwareEnforced
+                    .toArray()
+                    .firstOrNull {
+                        (it as? ASN1TaggedObject)?.tagNo == AttestationConstants.TAG_MODULE_HASH
+                    }
+                    ?.let {
+                        ASN1OctetString.getInstance((it as ASN1TaggedObject).baseObject).octets
+                    }
 
             val teeEnforced =
                 ASN1Sequence.getInstance(

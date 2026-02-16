@@ -1,5 +1,6 @@
 package org.matrix.TEESimulator.attestation
 
+import android.security.keystore.KeyProperties
 import java.nio.charset.StandardCharsets
 import java.security.cert.Certificate
 import java.security.cert.X509Certificate
@@ -8,6 +9,7 @@ import org.bouncycastle.asn1.x509.Extension
 import org.bouncycastle.cert.X509CertificateHolder
 import org.bouncycastle.cert.X509v3CertificateBuilder
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import org.matrix.TEESimulator.config.ConfigurationManager
 import org.matrix.TEESimulator.logging.SystemLogger
@@ -51,8 +53,7 @@ object AttestationPatcher {
 
                 // 2. Get the appropriate keybox for the given algorithm to sign the new
                 // certificate.
-                val algorithm = originalLeaf.publicKey.algorithm
-                val keybox = getKeyboxForUidAndAlgorithm(uid, algorithm)
+                val keybox = getKeyboxForUidAndAlgorithm(uid, originalLeaf.sigAlgName)
 
                 // 3. Create the new, patched leaf certificate.
                 val patchedLeaf =
@@ -80,6 +81,16 @@ object AttestationPatcher {
                 )
                 originalChain // Return the original chain on any error.
             }
+    }
+
+    /**
+     * Helper to normalize algorithm names for Bouncy Castle. Old Android versions might reports
+     * "SHA256WITHECDSA", but Bouncy Castle expects "SHA256withECDSA".
+     */
+    private fun normalizeSignatureAlgorithm(algoName: String): String {
+        // 1. Force uppercase to handle "sha256withecdsa"
+        // 2. Replace "WITH" with "with" to satisfy Bouncy Castle's naming convention
+        return algoName.uppercase().replace("WITH", "with")
     }
 
     /**
@@ -126,7 +137,10 @@ object AttestationPatcher {
         }
 
         // Sign the newly built certificate with the private key from our keybox.
-        val signer = JcaContentSignerBuilder(sigAlgName).build(keybox.keyPair.private)
+        val signer =
+            JcaContentSignerBuilder(normalizeSignatureAlgorithm(sigAlgName))
+                .setProvider(BouncyCastleProvider.PROVIDER_NAME)
+                .build(keybox.keyPair.private)
         val newCertificate = JcaX509CertificateConverter().getCertificate(builder.build(signer))
 
         // Log the signature of the newly created certificate to observe its non-deterministic
@@ -137,11 +151,34 @@ object AttestationPatcher {
         return newCertificate
     }
 
+    /**
+     * Retrieves the appropriate signing KeyBox (KeyPair and certificate chain) for a given UID
+     * based on a specified algorithm identifier.
+     *
+     * @param uid The UID of the application for which the signing is being performed.
+     * @param algorithm A string representing the desired algorithm. This can be either:
+     *     1. A simple key type like "RSA" or "EC".
+     *     2. A full JCA signature algorithm name like "SHA256withRSA".
+     *
+     * @return The [KeyBox] containing the appropriate key pair for signing.
+     * @throws IllegalArgumentException if no matching KeyBox can be found for the derived key type.
+     */
     private fun getKeyboxForUidAndAlgorithm(uid: Int, algorithm: String): KeyBox {
         val keyboxFile = ConfigurationManager.getKeyboxFileForUid(uid)
-        return KeyBoxManager.getAttestationKey(keyboxFile, algorithm)
+
+        // Normalize the algorithm name. The input might be a full signature algorithm
+        // (e.g., "SHA256withRSA") or just the key type (e.g., "RSA").
+        val keyType =
+            when {
+                algorithm.contains("RSA", ignoreCase = true) -> KeyProperties.KEY_ALGORITHM_RSA
+                algorithm.contains("EC", ignoreCase = true) ->
+                    KeyProperties.KEY_ALGORITHM_EC // This also covers "ECDSA"
+                else -> algorithm // If no match, assume it's already a simple key type string.
+            }
+
+        return KeyBoxManager.getAttestationKey(keyboxFile, keyType)
             ?: throw IllegalArgumentException(
-                "No keybox found for UID $uid and algorithm $algorithm in file $keyboxFile"
+                "No keybox found for UID $uid and algorithm '$keyType' (derived from input '$algorithm') in file $keyboxFile"
             )
     }
 
@@ -179,11 +216,37 @@ object AttestationPatcher {
         }
     }
 
+    // Function to check if a given ASN1Sequence contains the Root of Trust tag.
+    private fun sequenceContainsRootOfTrust(seq: ASN1Encodable): Boolean {
+        if (seq !is ASN1Sequence) return false
+        return seq.any { element ->
+            (element as? ASN1TaggedObject)?.tagNo == AttestationConstants.TAG_ROOT_OF_TRUST
+        }
+    }
+
     /** Parses the critical components from an existing attestation extension. */
     private fun parseAttestationExtension(certHolder: X509CertificateHolder): ParsedAttestation? {
         val extension = certHolder.getExtension(ATTESTATION_OID) ?: return null
         val sequence = ASN1Sequence.getInstance(extension.extnValue.octets)
         val allFields = sequence.toArray()
+
+        // Check if the fields are in the wrong order and swap them if necessary.
+        val softwareEnforcedCandidate =
+            allFields[AttestationConstants.KEY_DESCRIPTION_SOFTWARE_ENFORCED_INDEX]
+        val teeEnforcedCandidate =
+            allFields[AttestationConstants.KEY_DESCRIPTION_TEE_ENFORCED_INDEX]
+        // The signature of a swapped order: the RoT is in the software list's position.
+        if (
+            sequenceContainsRootOfTrust(softwareEnforcedCandidate) &&
+                !sequenceContainsRootOfTrust(teeEnforcedCandidate)
+        ) {
+            // Swap the elements in the array to restore the standard order.
+            allFields[AttestationConstants.KEY_DESCRIPTION_SOFTWARE_ENFORCED_INDEX] =
+                teeEnforcedCandidate
+            allFields[AttestationConstants.KEY_DESCRIPTION_TEE_ENFORCED_INDEX] =
+                softwareEnforcedCandidate
+        }
+
         val teeEnforced =
             allFields[AttestationConstants.KEY_DESCRIPTION_TEE_ENFORCED_INDEX] as ASN1Sequence
 

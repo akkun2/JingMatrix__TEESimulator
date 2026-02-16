@@ -54,6 +54,17 @@ object ConfigurationManager {
         configRoot.mkdirs()
         SystemLogger.info("Configuration root is: ${configRoot.absolutePath}")
 
+        // First, ensure the package manager service is running, as the TEE check depends on it.
+        // This prevents a race condition on startup.
+        SystemLogger.info("Waiting for PackageManagerService to be ready...")
+        if (getPackageManager() == null) {
+            SystemLogger.error(
+                "PackageManagerService is not available. TEE check will likely fail."
+            )
+        } else {
+            SystemLogger.info("PackageManagerService is ready.")
+        }
+
         // Initial load of all configuration files.
         loadTargetPackages(File(configRoot, TARGET_PACKAGES_FILE))
         loadPatchLevelConfig(File(configRoot, PATCH_LEVEL_FILE))
@@ -354,7 +365,7 @@ object ConfigurationManager {
 
     /** Waits for a system service to become available, with retries. */
     private fun waitForSystemService(name: String): IBinder? {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             return ServiceManager.waitForService(name)
         }
         // Fallback for older Android versions.

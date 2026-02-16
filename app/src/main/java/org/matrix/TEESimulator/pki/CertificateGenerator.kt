@@ -1,12 +1,12 @@
 package org.matrix.TEESimulator.pki
 
 import android.hardware.security.keymint.Algorithm
+import android.hardware.security.keymint.KeyPurpose
 import android.os.Build
 import android.util.Pair
 import java.math.BigInteger
 import java.security.KeyPair
 import java.security.KeyPairGenerator
-import java.security.Security
 import java.security.cert.Certificate
 import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
@@ -21,6 +21,7 @@ import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import org.matrix.TEESimulator.attestation.AttestationBuilder
+import org.matrix.TEESimulator.attestation.AttestationConstants
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
 import org.matrix.TEESimulator.interception.keystore.KeyIdentifier
@@ -34,14 +35,6 @@ import org.matrix.TEESimulator.logging.SystemLogger
  * that include a fully-featured, simulated attestation extension.
  */
 object CertificateGenerator {
-
-    init {
-        // Android ships with a stripped-down Bouncy Castle provider under the name "BC".
-        // We must remove the system provider first to ensure the full Bouncy Castle library
-        // (packaged with the app) is used.
-        Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
-        Security.addProvider(BouncyCastleProvider())
-    }
 
     /**
      * Generates a software-based cryptographic key pair.
@@ -89,6 +82,12 @@ object CertificateGenerator {
         params: KeyMintAttestation,
         securityLevel: Int,
     ): List<Certificate>? {
+        val challenge = params.attestationChallenge
+        if (challenge != null && challenge.size > AttestationConstants.CHALLENGE_LENGTH_LIMIT)
+            throw IllegalArgumentException(
+                "Attestation challenge exceeds length limit (${challenge.size} > ${AttestationConstants.CHALLENGE_LENGTH_LIMIT})"
+            )
+
         return runCatching {
                 val keybox = getKeyboxForAlgorithm(uid, params.algorithm)
 
@@ -189,6 +188,24 @@ object CertificateGenerator {
         }
     }
 
+    /** Maps KeyPurpose values to X.509 KeyUsage bits per KeyCreationResult.aidl spec */
+    private fun buildKeyUsageFromPurposes(purposes: List<Int>): Int {
+        var bits = 0
+        for (purpose in purposes) {
+            bits =
+                bits or
+                    when (purpose) {
+                        KeyPurpose.SIGN -> KeyUsage.digitalSignature
+                        KeyPurpose.DECRYPT -> KeyUsage.dataEncipherment
+                        KeyPurpose.WRAP_KEY -> KeyUsage.keyEncipherment
+                        KeyPurpose.AGREE_KEY -> KeyUsage.keyAgreement
+                        KeyPurpose.ATTEST_KEY -> KeyUsage.keyCertSign
+                        else -> 0
+                    }
+        }
+        return bits
+    }
+
     /** Constructs a new X.509 certificate with a simulated attestation extension. */
     private fun buildCertificate(
         subjectKeyPair: KeyPair,
@@ -213,8 +230,11 @@ object CertificateGenerator {
                 subjectKeyPair.public,
             )
 
-        // Add standard extensions.
-        builder.addExtension(Extension.keyUsage, true, KeyUsage(KeyUsage.keyCertSign))
+        // Add KeyUsage extension only if purposes map to valid bits
+        val keyUsageBits = buildKeyUsageFromPurposes(params.purpose)
+        if (keyUsageBits != 0) {
+            builder.addExtension(Extension.keyUsage, true, KeyUsage(keyUsageBits))
+        }
         // Add our custom, simulated attestation extension.
         builder.addExtension(
             AttestationBuilder.buildAttestationExtension(params, uid, securityLevel)
@@ -226,7 +246,10 @@ object CertificateGenerator {
                 Algorithm.RSA -> "SHA256withRSA"
                 else -> throw IllegalArgumentException("Unsupported algorithm: ${params.algorithm}")
             }
-        val contentSigner = JcaContentSignerBuilder(signerAlgorithm).build(signingKeyPair.private)
+        val contentSigner =
+            JcaContentSignerBuilder(signerAlgorithm)
+                .setProvider(BouncyCastleProvider.PROVIDER_NAME)
+                .build(signingKeyPair.private)
 
         return JcaX509CertificateConverter().getCertificate(builder.build(contentSigner))
     }
